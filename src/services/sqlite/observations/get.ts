@@ -54,6 +54,15 @@ export function getObservationsByFilePath(
       (o.files_read LIKE '[%' AND EXISTS (SELECT 1 FROM json_each(o.files_read) WHERE value IN (${pathPlaceholders})))
       OR (o.files_modified LIKE '[%' AND EXISTS (SELECT 1 FROM json_each(o.files_modified) WHERE value IN (${pathPlaceholders})))
     )
+    AND EXISTS (
+      SELECT 1 FROM chroma_index_ledger cil
+      WHERE cil.doc_type = 'observation' AND cil.sqlite_id = o.id
+        AND cil.status = 'clean'
+        AND cil.updated_at_epoch = (
+          SELECT MAX(latest.updated_at_epoch) FROM chroma_index_ledger latest
+          WHERE latest.doc_type = 'observation' AND latest.sqlite_id = o.id
+        )
+    )
     ${projectClause}
     ${platformClause}
     ORDER BY created_at_epoch DESC

@@ -141,6 +141,10 @@ export class ChromaSearchStrategy {
   private buildWhereFilter(searchType: string, project?: string, platformSource?: string): Record<string, any> | undefined {
     const filters: Array<Record<string, any>> = [];
 
+    // Retrieval policy is intentionally supplied to the vector store as well
+    // as checked locally in ChromaSync. Missing/unknown ACL never matches.
+    filters.push({ sensitivity: 'private' }, { acl: 'owner_local' });
+
     switch (searchType) {
       case 'observations':
         filters.push({ doc_type: 'observation' });
@@ -230,11 +234,14 @@ export class ChromaSearchStrategy {
 
     for (const item of items) {
       const docType = item.meta?.doc_type;
-      if (docType === 'observation' && options.searchObservations) {
+      if (docType === 'observation' && options.searchObservations
+        && this.sessionStore.isChromaSourceEligible('observation', item.id)) {
         obsIds.push(item.id);
-      } else if (docType === 'session_summary' && options.searchSessions) {
+      } else if (docType === 'session_summary' && options.searchSessions
+        && this.sessionStore.isChromaSourceEligible('session_summary', item.id)) {
         sessionIds.push(item.id);
-      } else if (docType === 'user_prompt' && options.searchPrompts) {
+      } else if (docType === 'user_prompt' && options.searchPrompts
+        && this.sessionStore.isChromaSourceEligible('user_prompt', item.id)) {
         promptIds.push(item.id);
       }
     }

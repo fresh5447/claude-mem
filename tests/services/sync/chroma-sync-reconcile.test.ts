@@ -84,9 +84,9 @@ describe('ChromaSync duplicate-ID reconcile', () => {
     const docs = [{ id: 'obs_1_narrative', document: 'hello world', metadata: { sqlite_id: 1 } }];
 
     // First write inserts, second collides and must reconcile in place.
-    await sync.addDocuments(docs);
+    await (sync as any).writeDocuments(docs);
     calls.length = 0;
-    const written = await sync.addDocuments(docs);
+    const written = await (sync as any).writeDocuments(docs);
 
     expect(written).toBe(1);
     const tools = calls.map(c => c.tool);
@@ -102,10 +102,10 @@ describe('ChromaSync duplicate-ID reconcile', () => {
   it('splits a mixed batch: updates the existing ID and INSERTS the new one', async () => {
     const sync = newSync();
     // Pre-seed one document so the next batch has one colliding + one new ID.
-    await sync.addDocuments([{ id: 'obs_1_narrative', document: 'v1', metadata: { sqlite_id: 1 } }]);
+    await (sync as any).writeDocuments([{ id: 'obs_1_narrative', document: 'v1', metadata: { sqlite_id: 1 } }]);
     calls.length = 0;
 
-    const written = await sync.addDocuments([
+    const written = await (sync as any).writeDocuments([
       { id: 'obs_1_narrative', document: 'v2', metadata: { sqlite_id: 1 } },
       { id: 'obs_2_narrative', document: 'brand new', metadata: { sqlite_id: 2 } },
     ]);

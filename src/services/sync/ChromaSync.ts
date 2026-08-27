@@ -12,6 +12,13 @@ import type { SessionStore as SessionStoreType } from '../sqlite/SessionStore.js
 import { logger } from '../../utils/logger.js';
 import { ChromaUnavailableError } from '../worker/search/errors.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import {
+  chromaSourceHash,
+  detectChromaSecretFindings,
+  isChromaContentHash,
+  isOwnerLocalPrivateMetadata,
+  type ChromaDocType,
+} from './ChromaIndexPolicy.js';
 import type * as SqliteFilesModule from '../sqlite/observations/files.js';
 
 type SessionStore = SessionStoreType;
@@ -47,6 +54,18 @@ export interface ChromaDocument {
 export interface MergedIntoProjectTarget {
   docType: 'observation' | 'session_summary';
   sqliteId: number;
+}
+
+export interface ChromaFixtureDocument {
+  id: string;
+  metadata: Record<string, unknown>;
+}
+
+/** Small injected surface used by fixture-only audit/reconciliation tests. */
+export interface ChromaIndexAdapter {
+  list(): Promise<ChromaFixtureDocument[]>;
+  delete(ids: string[]): Promise<void>;
+  update(ids: string[], metadatas: Record<string, unknown>[]): Promise<void>;
 }
 
 interface StoredObservation {
@@ -102,7 +121,7 @@ export class ChromaSync {
   private collectionCreation: Promise<void> | null = null;
   private readonly BATCH_SIZE = 100;
 
-  constructor(project: string) {
+  constructor(project: string, private readonly sessionStore?: SessionStore) {
     this.project = project;
     const sanitized = project
       .replace(/[^a-zA-Z0-9._-]/g, '_')
@@ -165,6 +184,9 @@ export class ChromaSync {
     const baseMetadata: Record<string, string | number | null> = {
       sqlite_id: obs.id,
       doc_type: 'observation',
+      source_table: 'observations',
+      sensitivity: 'private',
+      acl: 'owner_local',
       memory_session_id: obs.memory_session_id,
       project: obs.project,
       merged_into_project: obs.merged_into_project ?? null,
@@ -222,6 +244,9 @@ export class ChromaSync {
     const baseMetadata: Record<string, string | number | null> = {
       sqlite_id: summary.id,
       doc_type: 'session_summary',
+      source_table: 'session_summaries',
+      sensitivity: 'private',
+      acl: 'owner_local',
       memory_session_id: summary.memory_session_id,
       project: summary.project,
       merged_into_project: summary.merged_into_project ?? null,
@@ -284,21 +309,17 @@ export class ChromaSync {
   }
 
   /**
-   * Write `documents` to Chroma in BATCH_SIZE-sized batches.
-   *
-   * Returns the number of documents that were successfully written (or
-   * confirmed via delete+add reconcile). Per-batch failures are logged and the
-   * loop continues — we never throw — so callers must use the returned count
-   * to advance their watermark, otherwise an interrupted backfill can mark
-   * unsynced records as synced.
-   *
-   * Visibility: promoted from `private` to `public` for cmem-sdk Phase 6.
-   * The SDK indexes Postgres observations into Chroma using this same
-   * storage-agnostic document layer — same retry/dedupe semantics, same
-   * BATCH_SIZE. SQLite-shaped `syncObservation` is NOT reusable for the
-   * Postgres UUID path. See plan §6 line 244-247.
+   * The former storage-agnostic entry point is intentionally fail-closed.
+   * Chroma writes must carry a private source row through indexSourceRow(),
+   * which is the one policy boundary that has the complete row to scan.
    */
-  public async addDocuments(documents: ChromaDocument[]): Promise<number> {
+  public async addDocuments(_documents: ChromaDocument[]): Promise<number> {
+    logger.warn('CHROMA_SYNC', 'Refused direct Chroma write outside the source policy gate');
+    return 0;
+  }
+
+  /** Write policy-admitted documents to Chroma in BATCH_SIZE-sized batches. */
+  private async writeDocuments(documents: ChromaDocument[]): Promise<number> {
     if (documents.length === 0) {
       return 0;
     }
@@ -428,6 +449,301 @@ export class ChromaSync {
     return written;
   }
 
+  /**
+   * Single row-atomic boundary for every SQLite-originated add/update. Secret
+   * scanning deliberately uses the complete serialized source row, rather than
+   * just a generated document field, so one finding suppresses all siblings.
+   */
+  private async indexSourceRow(
+    store: SessionStore | undefined,
+    docType: ChromaDocType,
+    sqliteId: number,
+  ): Promise<{ written: number; documents: number; quarantined: boolean }> {
+    // There is deliberately no DTO-only fallback. Both the admission decision
+    // and every embedded document come from the same persisted source row, so
+    // a caller cannot pair a clean stored revision with secret-bearing DTO
+    // text (or vice versa).
+    if (!store) {
+      logger.warn('CHROMA_SYNC', 'Refused source indexing without a private source policy store', { docType, sqliteId });
+      return { written: 0, documents: 0, quarantined: false };
+    }
+    const completeSourceRow = this.loadCompleteSourceRow(store, docType, sqliteId);
+    if (completeSourceRow === undefined) {
+      logger.warn('CHROMA_SYNC', 'Source row missing before index; refusing to embed', { docType, sqliteId });
+      return { written: 0, documents: 0, quarantined: true };
+    }
+    const contentSha256 = chromaSourceHash(completeSourceRow);
+    if (!await this.admitSourceRow(store, docType, sqliteId, completeSourceRow, contentSha256)) {
+      return { written: 0, documents: 0, quarantined: true };
+    }
+    const documents = this.formatDocumentsFromSourceRow(store, docType, sqliteId, completeSourceRow);
+    if (!documents) {
+      logger.warn('CHROMA_SYNC', 'Source provenance missing before index; refusing to embed', { docType, sqliteId });
+      return { written: 0, documents: 0, quarantined: false };
+    }
+    // The ledger key travels with every vector. This lets fixture audit and
+    // retrieval distinguish a quarantined historical source revision from a
+    // later clean revision for the same SQLite row.
+    const admittedDocuments = documents.map(document => ({
+      ...document,
+      metadata: { ...document.metadata, content_sha256: contentSha256 },
+    }));
+    if (!admittedDocuments.every(document => this.isPolicyAdmittedDocument(document, docType, sqliteId))) {
+      logger.warn('CHROMA_SYNC', 'Refused malformed source documents at policy gate', { docType, sqliteId });
+      return { written: 0, documents: documents.length, quarantined: true };
+    }
+    return { written: await this.writeDocuments(admittedDocuments), documents: admittedDocuments.length, quarantined: false };
+  }
+
+  /**
+   * Format only the source row that was just scanned and hashed. Provenance is
+   * loaded from its owning session solely to populate required vector metadata.
+   */
+  private formatDocumentsFromSourceRow(
+    store: SessionStore,
+    docType: ChromaDocType,
+    sqliteId: number,
+    completeSourceRow: unknown,
+  ): ChromaDocument[] | undefined {
+    if (!completeSourceRow || typeof completeSourceRow !== 'object' || Array.isArray(completeSourceRow)) return undefined;
+    const provenance = this.loadSourceProvenance(store, docType, sqliteId);
+    if (!provenance) return undefined;
+    const source = completeSourceRow as Record<string, unknown>;
+    if (docType === 'observation') {
+      return this.formatObservationDocs({
+        ...source,
+        project: provenance.project,
+        platform_source: provenance.platform_source,
+      } as StoredObservation);
+    }
+    if (docType === 'session_summary') {
+      return this.formatSummaryDocs({
+        ...source,
+        project: provenance.project,
+        platform_source: provenance.platform_source,
+      } as StoredSummary);
+    }
+    // user_prompts own their text, while session identity/provenance lives in
+    // sdk_sessions. Read that association after the complete prompt row is
+    // scanned; it is never accepted from the caller DTO.
+    const promptSession = store.db.prepare(`SELECT s.memory_session_id
+      FROM user_prompts up JOIN sdk_sessions s ON s.id = up.session_db_id WHERE up.id = ?`).get(sqliteId);
+    if (!promptSession || typeof (promptSession as { memory_session_id?: unknown }).memory_session_id !== 'string') return undefined;
+    return [this.formatUserPromptDoc({
+      ...source,
+      memory_session_id: (promptSession as { memory_session_id: string }).memory_session_id,
+      project: provenance.project,
+      platform_source: provenance.platform_source,
+    } as StoredUserPrompt)];
+  }
+
+  /** Admit one complete source row before any add or update for its identity. */
+  private async admitSourceRow(
+    store: SessionStore | undefined,
+    docType: ChromaDocType,
+    sqliteId: number,
+    completeSourceRow: unknown,
+    contentSha256 = chromaSourceHash(completeSourceRow),
+  ): Promise<boolean> {
+    if (!store) return false;
+    const findings = detectChromaSecretFindings(completeSourceRow);
+    if (findings.length > 0) {
+      store.recordChromaIndexPolicy(docType, sqliteId, contentSha256, findings, 'quarantined');
+      // A rescan also reconciles any legacy documents for this exact source.
+      await this.deleteSourceDocuments(docType, sqliteId).catch(error => {
+        logger.warn('CHROMA_SYNC', 'Could not reconcile quarantined source documents', { docType, sqliteId }, error as Error);
+      });
+      return false;
+    }
+    const sourceStatus = store.getChromaSourceStatus(docType, sqliteId);
+    if (sourceStatus === 'deleted') return false;
+    store.recordChromaIndexPolicy(docType, sqliteId, contentSha256, [], 'clean');
+    return true;
+  }
+
+  private isPolicyAdmittedDocument(document: ChromaDocument, docType: ChromaDocType, sqliteId: number): boolean {
+    return document.metadata.doc_type === docType
+      && document.metadata.sqlite_id === sqliteId
+      && isOwnerLocalPrivateMetadata(document.metadata);
+  }
+
+  private loadCompleteSourceRow(store: SessionStore, docType: ChromaDocType, sqliteId: number): unknown | undefined {
+    const table = docType === 'observation'
+      ? 'observations'
+      : docType === 'session_summary'
+        ? 'session_summaries'
+        : 'user_prompts';
+    return store.db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(sqliteId) ?? undefined;
+  }
+
+  private loadSourceProvenance(
+    store: SessionStore,
+    docType: ChromaDocType,
+    sqliteId: number,
+  ): { source_table: string; project: string; platform_source: string } | undefined {
+    const sourceTable = docType === 'observation'
+      ? 'observations'
+      : docType === 'session_summary'
+        ? 'session_summaries'
+        : 'user_prompts';
+    const row = (docType === 'observation'
+      ? store.db.prepare(`SELECT o.project, COALESCE(NULLIF(s.platform_source, ''), 'claude') AS platform_source
+          FROM observations o LEFT JOIN sdk_sessions s ON s.memory_session_id = o.memory_session_id WHERE o.id = ?`).get(sqliteId)
+      : docType === 'session_summary'
+        ? store.db.prepare(`SELECT ss.project, COALESCE(NULLIF(s.platform_source, ''), 'claude') AS platform_source
+            FROM session_summaries ss LEFT JOIN sdk_sessions s ON s.memory_session_id = ss.memory_session_id WHERE ss.id = ?`).get(sqliteId)
+        : store.db.prepare(`SELECT s.project, COALESCE(NULLIF(s.platform_source, ''), 'claude') AS platform_source
+            FROM user_prompts up JOIN sdk_sessions s ON s.id = up.session_db_id WHERE up.id = ?`).get(sqliteId)) as { project?: unknown; platform_source?: unknown } | undefined;
+    if (!row || typeof row.project !== 'string' || !row.project) return undefined;
+    return {
+      source_table: sourceTable,
+      project: row.project,
+      platform_source: normalizePlatformSource(typeof row.platform_source === 'string' ? row.platform_source : undefined),
+    };
+  }
+
+  /** Delete every document for one exact source identity; no document text is read. */
+  async deleteSourceDocuments(docType: ChromaDocType, sqliteId: number): Promise<void> {
+    await this.ensureCollectionExists();
+    await ChromaMcpManager.getInstance().callTool('chroma_delete_documents', {
+      collection_name: this.collectionName,
+      where: { $and: [{ doc_type: docType }, { sqlite_id: sqliteId }] },
+    });
+  }
+
+  async deleteSource(docType: ChromaDocType, sqliteId: number, store = this.sessionStore): Promise<void> {
+    if (store?.getChromaSourceStatus(docType, sqliteId) !== 'deleted') {
+      store?.markChromaSourceDeleted(docType, sqliteId);
+    }
+    await this.deleteSourceDocuments(docType, sqliteId);
+  }
+
+  /** Retry durable tombstones after an interrupted or unavailable deletion. */
+  async reconcileDeletedSources(store = this.sessionStore): Promise<number> {
+    if (!store) return 0;
+    let deleted = 0;
+    for (const { docType, sqliteId } of store.getChromaDeletedSources()) {
+      await this.deleteSourceDocuments(docType, sqliteId);
+      deleted++;
+    }
+    return deleted;
+  }
+
+  /** Read-only fixture audit; callers provide an adapter so this never opens Chroma. */
+  async auditIndex(adapter: Pick<ChromaIndexAdapter, 'list'>): Promise<ChromaFixtureDocument[]> {
+    const documents = await adapter.list();
+    return documents.filter(document => {
+      const metadata = document.metadata;
+      const docType = metadata.doc_type;
+      const sqliteId = metadata.sqlite_id;
+      if (docType !== 'observation' && docType !== 'session_summary' && docType !== 'user_prompt') return true;
+      if (!Number.isInteger(sqliteId) || !isOwnerLocalPrivateMetadata(metadata)) return true;
+      // A vector has no standing without a store decision for its exact source
+      // revision. In particular, do not collapse a quarantined hash A into a
+      // later clean hash B for the same (doc_type, sqlite_id) pair.
+      return !this.sessionStore
+        || !this.sessionStore.isChromaEmbeddingEligible(docType, sqliteId as number, metadata.content_sha256 as string);
+    });
+  }
+
+  /**
+   * Idempotently removes quarantined/deleted fixture documents and supplies
+   * missing provenance for known-clean legacy rows. The caller owns the
+   * adapter; production code does not invoke this during validation.
+   */
+  async reconcileIndex(adapter: ChromaIndexAdapter): Promise<{ deleted: number; updated: number }> {
+    const documents = await adapter.list();
+    const deleteIds: string[] = [];
+    const updateIds: string[] = [];
+    const metadatas: Record<string, unknown>[] = [];
+    for (const document of documents) {
+      const metadata = document.metadata;
+      const docType = metadata.doc_type;
+      const sqliteId = metadata.sqlite_id;
+      if (docType !== 'observation' && docType !== 'session_summary' && docType !== 'user_prompt' || !Number.isInteger(sqliteId)) {
+        deleteIds.push(document.id);
+        continue;
+      }
+      const contentSha256 = metadata.content_sha256;
+      const exactStatus = this.sessionStore && isChromaContentHash(contentSha256)
+        ? this.sessionStore.getChromaIndexStatus(docType, sqliteId as number, contentSha256)
+        : null;
+      if (!this.sessionStore || exactStatus === 'quarantined' || exactStatus === 'deleted') {
+        deleteIds.push(document.id);
+      } else {
+        const sourceRow = this.sessionStore
+          ? this.loadCompleteSourceRow(this.sessionStore, docType, sqliteId as number)
+          : undefined;
+        const findings = sourceRow === undefined ? [] : detectChromaSecretFindings(sourceRow);
+        // Reconciliation is an update path too, so it re-scans the complete
+        // current row. Its adapter-only deletion keeps fixture validation from
+        // opening a live collection.
+        if (sourceRow === undefined || findings.length > 0) {
+          if (sourceRow !== undefined) {
+            this.sessionStore?.recordChromaIndexPolicy(
+              docType,
+              sqliteId as number,
+              chromaSourceHash(sourceRow),
+              findings,
+              'quarantined',
+            );
+          }
+          deleteIds.push(document.id);
+          continue;
+        }
+        // A metadata-bearing document with no exact ledger entry cannot be
+        // authenticated as clean. Only hashless legacy documents may be
+        // upgraded from the current complete source row.
+        const sourceSha256 = chromaSourceHash(sourceRow);
+        if (isChromaContentHash(contentSha256) && (
+          exactStatus !== 'clean' || contentSha256 !== sourceSha256
+        )) {
+          // A known historical hash is never upgraded to the current hash.
+          // Its document text may be an older (or quarantined) revision, so
+          // only a fresh source-gated write may create the current vector.
+          deleteIds.push(document.id);
+          continue;
+        }
+        // Pre-v50 embeddings have no ledger entry. Re-scan their current
+        // private source row before upgrading metadata, then record the clean
+        // decision so retrieval can fail closed until this reconciliation.
+        this.sessionStore?.recordChromaIndexPolicy(
+          docType,
+          sqliteId as number,
+          sourceSha256,
+          [],
+          'clean',
+        );
+        const provenance = this.sessionStore
+          ? this.loadSourceProvenance(this.sessionStore, docType, sqliteId as number)
+          : undefined;
+        // A clean ledger alone cannot authenticate a legacy vector. If its
+        // private source row is gone, remove the incomplete metadata rather
+        // than inventing project/platform provenance.
+        if (!provenance) {
+          deleteIds.push(document.id);
+          continue;
+        }
+        const upgraded = {
+          ...metadata,
+          doc_type: docType,
+          sqlite_id: sqliteId,
+          ...provenance,
+          sensitivity: 'private',
+          acl: 'owner_local',
+          content_sha256: isChromaContentHash(contentSha256) ? contentSha256 : sourceSha256,
+        };
+        if (JSON.stringify(upgraded) !== JSON.stringify(metadata)) {
+          updateIds.push(document.id);
+          metadatas.push(upgraded);
+        }
+      }
+    }
+    if (deleteIds.length) await adapter.delete(deleteIds);
+    if (updateIds.length) await adapter.update(updateIds, metadatas);
+    return { deleted: deleteIds.length, updated: updateIds.length };
+  }
+
   async syncObservation(
     observationId: number,
     memorySessionId: string,
@@ -437,30 +753,9 @@ export class ChromaSync {
     createdAtEpoch: number,
     platformSource?: string
   ): Promise<void> {
-    const stored: StoredObservation = {
-      id: observationId,
-      memory_session_id: memorySessionId,
-      project: project,
-      merged_into_project: null,
-      platform_source: platformSource ? normalizePlatformSource(platformSource) : normalizePlatformSource(undefined),
-      text: null, // Legacy field, not used
-      type: obs.type,
-      title: obs.title,
-      subtitle: obs.subtitle,
-      facts: JSON.stringify(obs.facts),
-      narrative: obs.narrative,
-      concepts: JSON.stringify(obs.concepts),
-      files_read: JSON.stringify(obs.files_read),
-      files_modified: JSON.stringify(obs.files_modified),
-      prompt_number: promptNumber,
-      created_at_epoch: createdAtEpoch
-    };
-
-    const documents = this.formatObservationDocs(stored);
-
     logger.info('CHROMA_SYNC', 'Syncing observation', {
       observationId,
-      documentCount: documents.length,
+      documentSource: 'persisted_row',
       project
     });
 
@@ -469,15 +764,15 @@ export class ChromaSync {
     // Chroma error must NOT mark this observation as synced — otherwise the
     // backfill pass on next boot will skip past it (CodeRabbit review on PR
     // #2282).
-    const written = await this.addDocuments(documents);
-    if (written === documents.length) {
+    const outcome = await this.indexSourceRow(this.sessionStore, 'observation', observationId);
+    if (outcome.quarantined || (this.sessionStore && outcome.written === outcome.documents)) {
       ChromaSyncState.bump(project, 'observations', observationId);
     } else {
       logger.warn('CHROMA_SYNC', 'Observation watermark bump skipped — partial write', {
         observationId,
         project,
-        requested: documents.length,
-        written
+        requested: outcome.documents,
+        written: outcome.written
       });
     }
   }
@@ -491,40 +786,22 @@ export class ChromaSync {
     createdAtEpoch: number,
     platformSource?: string
   ): Promise<void> {
-    const stored: StoredSummary = {
-      id: summaryId,
-      memory_session_id: memorySessionId,
-      project: project,
-      merged_into_project: null,
-      platform_source: platformSource ? normalizePlatformSource(platformSource) : normalizePlatformSource(undefined),
-      request: summary.request,
-      investigated: summary.investigated,
-      learned: summary.learned,
-      completed: summary.completed,
-      next_steps: summary.next_steps,
-      notes: summary.notes,
-      prompt_number: promptNumber,
-      created_at_epoch: createdAtEpoch
-    };
-
-    const documents = this.formatSummaryDocs(stored);
-
     logger.info('CHROMA_SYNC', 'Syncing summary', {
       summaryId,
-      documentCount: documents.length,
+      documentSource: 'persisted_row',
       project
     });
 
     // Only bump on a confirmed full write — see syncObservation() for rationale.
-    const written = await this.addDocuments(documents);
-    if (written === documents.length) {
+    const outcome = await this.indexSourceRow(this.sessionStore, 'session_summary', summaryId);
+    if (outcome.quarantined || (this.sessionStore && outcome.written === outcome.documents)) {
       ChromaSyncState.bump(project, 'summaries', summaryId);
     } else {
       logger.warn('CHROMA_SYNC', 'Summary watermark bump skipped — partial write', {
         summaryId,
         project,
-        requested: documents.length,
-        written
+        requested: outcome.documents,
+        written: outcome.written
       });
     }
   }
@@ -536,6 +813,9 @@ export class ChromaSync {
       metadata: {
         sqlite_id: prompt.id,
         doc_type: 'user_prompt',
+        source_table: 'user_prompts',
+        sensitivity: 'private',
+        acl: 'owner_local',
         memory_session_id: prompt.memory_session_id,
         project: prompt.project,
         platform_source: prompt.platform_source,
@@ -554,33 +834,20 @@ export class ChromaSync {
     createdAtEpoch: number,
     platformSource?: string
   ): Promise<void> {
-    const stored: StoredUserPrompt = {
-      id: promptId,
-      content_session_id: '', // Not needed for Chroma sync
-      prompt_number: promptNumber,
-      prompt_text: promptText,
-      created_at_epoch: createdAtEpoch,
-      memory_session_id: memorySessionId,
-      project: project,
-      platform_source: normalizePlatformSource(platformSource)
-    };
-
-    const document = this.formatUserPromptDoc(stored);
-
     logger.info('CHROMA_SYNC', 'Syncing user prompt', {
       promptId,
       project
     });
 
     // Only bump on a confirmed full write — see syncObservation() for rationale.
-    const written = await this.addDocuments([document]);
-    if (written === 1) {
+    const outcome = await this.indexSourceRow(this.sessionStore, 'user_prompt', promptId);
+    if (outcome.quarantined || (this.sessionStore && outcome.documents > 0 && outcome.written === outcome.documents)) {
       ChromaSyncState.bump(project, 'prompts', promptId);
     } else {
       logger.warn('CHROMA_SYNC', 'Prompt watermark bump skipped — write failed', {
         promptId,
         project,
-        written
+        written: outcome.written
       });
     }
   }
@@ -756,8 +1023,10 @@ export class ChromaSync {
    * restart can strand the tail of a split row forever.
    */
   private async backfillKind<T extends { id: number }>(
+    store: SessionStore,
     rows: T[],
     formatDocs: (row: T) => ChromaDocument[],
+    docType: ChromaDocType,
     kind: 'observations' | 'summaries' | 'prompts',
     backfillProject: string
   ): Promise<number> {
@@ -766,37 +1035,31 @@ export class ChromaSync {
     let processedDocs = 0;
 
     for (const { row, docs } of rowsWithDocs) {
-      if (docs.length === 0) {
-        continue;
-      }
-
       let rowComplete = true;
-      for (let i = 0; i < docs.length; i += this.BATCH_SIZE) {
-        const batch = docs.slice(i, i + this.BATCH_SIZE);
-        const writtenInBatch = await this.addDocuments(batch);
-        processedDocs += batch.length;
-        // Only advance the watermark for documents that actually landed in
-        // Chroma. addDocuments() logs and continues on per-batch failures, so a
-        // partial write must not mark unwritten docs as synced.
-        if (writtenInBatch < batch.length) {
-          ChromaSyncState.markPending(backfillProject, kind, [row.id]);
-          logger.debug('CHROMA_SYNC', 'Recorded pending watermark gap for failed/partial row batch', {
-            project: backfillProject,
-            kind,
-            rowId: row.id,
-            batchStart: i,
-            requested: batch.length,
-            written: writtenInBatch
-          });
-          rowComplete = false;
-          break;
-        }
-
-        logger.debug('CHROMA_SYNC', 'Backfill progress', {
+      // indexSourceRow formats the persisted row itself and writeDocuments()
+      // owns batching. This keeps one source-row decision bound to all of its
+      // generated documents even when a row spans multiple Chroma batches.
+      // Do not skip a zero-document preliminary format: its complete source
+      // row can still contain a secret in an unembedded column, and must get
+      // a durable admission decision before its watermark advances.
+      const outcome = await this.indexSourceRow(store, docType, row.id);
+      processedDocs += docs.length;
+      if (!outcome.quarantined && outcome.written < outcome.documents) {
+        ChromaSyncState.markPending(backfillProject, kind, [row.id]);
+        logger.debug('CHROMA_SYNC', 'Recorded pending watermark gap for failed/partial row', {
           project: backfillProject,
-          progress: `${Math.min(processedDocs, totalDocs)}/${totalDocs}`
+          kind,
+          rowId: row.id,
+          requested: outcome.documents,
+          written: outcome.written
         });
+        rowComplete = false;
       }
+
+      logger.debug('CHROMA_SYNC', 'Backfill progress', {
+        project: backfillProject,
+        progress: `${Math.min(processedDocs, totalDocs)}/${totalDocs}`
+      });
 
       if (!rowComplete) {
         continue;
@@ -860,7 +1123,7 @@ export class ChromaSync {
       total: totalObsCount.count
     });
 
-    return this.backfillKind(rows, obs => this.formatObservationDocs(obs), 'observations', backfillProject);
+    return this.backfillKind(db, rows, obs => this.formatObservationDocs(obs), 'observation', 'observations', backfillProject);
   }
 
   private async backfillSummaries(
@@ -914,7 +1177,7 @@ export class ChromaSync {
       total: totalSummaryCount.count
     });
 
-    return this.backfillKind(rows, summary => this.formatSummaryDocs(summary), 'summaries', backfillProject);
+    return this.backfillKind(db, rows, summary => this.formatSummaryDocs(summary), 'session_summary', 'summaries', backfillProject);
   }
 
   private async backfillPrompts(
@@ -975,7 +1238,7 @@ export class ChromaSync {
       total: totalPromptCount.count
     });
 
-    return this.backfillKind(rows, prompt => [this.formatUserPromptDoc(prompt)], 'prompts', backfillProject);
+    return this.backfillKind(db, rows, prompt => [this.formatUserPromptDoc(prompt)], 'user_prompt', 'prompts', backfillProject);
   }
 
   async queryChroma(
@@ -983,16 +1246,27 @@ export class ChromaSync {
     limit: number,
     whereFilter?: Record<string, any>
   ): Promise<{ ids: number[]; distances: number[]; metadatas: any[] }> {
+    if (!this.sessionStore) {
+      logger.warn('CHROMA_SYNC', 'Refused Chroma retrieval without a source policy store');
+      return { ids: [], distances: [], metadatas: [] };
+    }
     await this.ensureCollectionExists();
 
     let results: any;
+    const privateAclFilter = { $and: [
+      { sensitivity: 'private' },
+      { acl: 'owner_local' },
+    ] };
+    const enforcedFilter = whereFilter
+      ? { $and: [privateAclFilter, whereFilter] }
+      : privateAclFilter;
     try {
       const chromaMcp = ChromaMcpManager.getInstance();
       results = await chromaMcp.callTool('chroma_query_documents', {
         collection_name: this.collectionName,
         query_texts: [query],
         n_results: limit,
-        ...(whereFilter && { where: whereFilter }),
+        where: enforcedFilter,
         include: ['documents', 'metadatas', 'distances']
       });
     } catch (error) {
@@ -1020,6 +1294,7 @@ export class ChromaSync {
   }
 
   private deduplicateQueryResults(results: any): { ids: number[]; distances: number[]; metadatas: any[] } {
+    if (!this.sessionStore) return { ids: [], distances: [], metadatas: [] };
     const ids: number[] = [];
     const seen = new Set<string>();
     const docIds = results?.ids?.[0] || [];
@@ -1031,12 +1306,17 @@ export class ChromaSync {
 
     for (let i = 0; i < docIds.length; i++) {
       const docId = docIds[i];
+      const metadata = rawMetadatas[i] ?? null;
+      // Chroma filtering alone cannot protect against malformed legacy data or
+      // adapters with partial where support. Treat absent/unknown policy as
+      // ineligible before ID parsing/hydration.
+      if (!isOwnerLocalPrivateMetadata(metadata)) continue;
       const obsMatch = docId.match(/obs_(\d+)_/);
       const summaryMatch = docId.match(/summary_(\d+)_/);
       const promptMatch = docId.match(/prompt_(\d+)/);
 
       let sqliteId: number | null = null;
-      let entityType: string | null = null;
+      let entityType: ChromaDocType | null = null;
       if (obsMatch) {
         sqliteId = parseInt(obsMatch[1], 10);
         entityType = 'observation';
@@ -1049,11 +1329,13 @@ export class ChromaSync {
       }
 
       if (sqliteId !== null && entityType) {
+        if (metadata.doc_type !== entityType) continue;
+        if (!this.sessionStore.isChromaEmbeddingEligible(entityType, sqliteId, metadata.content_sha256)) continue;
         const dedupeKey = `${entityType}:${sqliteId}`;
         if (seen.has(dedupeKey)) continue;
         seen.add(dedupeKey);
         ids.push(sqliteId);
-        metadatas.push(rawMetadatas[i] ?? null);
+        metadatas.push(metadata);
         distances.push(rawDistances[i] ?? 0);
       }
     }
@@ -1085,7 +1367,7 @@ export class ChromaSync {
       return;
     }
 
-    const sync = new ChromaSync('claude-mem');
+    const sync = new ChromaSync('claude-mem', store);
 
     ChromaSync.backfillInProgress = true;
     try {
@@ -1144,6 +1426,10 @@ export class ChromaSync {
     mergedIntoProject: string
   ): Promise<void> {
     if (targets.length === 0) return;
+    if (!this.sessionStore) {
+      logger.warn('CHROMA_SYNC', 'Refused merged-project Chroma update without a source policy store');
+      return;
+    }
 
     await this.ensureCollectionExists();
     const chromaMcp = ChromaMcpManager.getInstance();
@@ -1156,7 +1442,23 @@ export class ChromaSync {
         .map(target => target.sqliteId);
 
       for (let i = 0; i < sqliteIds.length; i += this.BATCH_SIZE) {
-        const idBatch = sqliteIds.slice(i, i + this.BATCH_SIZE);
+        const candidates = sqliteIds.slice(i, i + this.BATCH_SIZE);
+        const provenanceById = new Map<number, {
+          source_table: string;
+          project: string;
+          platform_source: string;
+          content_sha256: string;
+        }>();
+        for (const sqliteId of candidates) {
+          const row = this.loadCompleteSourceRow(this.sessionStore, docType, sqliteId);
+          if (row === undefined || !await this.admitSourceRow(this.sessionStore, docType, sqliteId, row)) continue;
+          const provenance = this.loadSourceProvenance(this.sessionStore, docType, sqliteId);
+          if (provenance) {
+            provenanceById.set(sqliteId, { ...provenance, content_sha256: chromaSourceHash(row) });
+          }
+        }
+        const idBatch = [...provenanceById.keys()];
+        if (idBatch.length === 0) continue;
 
         const existing = await chromaMcp.callTool('chroma_get_documents', {
           collection_name: this.collectionName,
@@ -1172,24 +1474,56 @@ export class ChromaSync {
         const docIds: string[] = existing?.ids ?? [];
         if (docIds.length === 0) continue;
 
-        const metadatas = (existing?.metadatas ?? []).map(m => {
+        const updates = docIds.map((id, index) => {
+          const m = existing?.metadatas?.[index];
+          const sqliteId = m?.sqlite_id;
+          const provenance = typeof sqliteId === 'number' ? provenanceById.get(sqliteId) : undefined;
+          if (!provenance) return undefined;
+          const existingHash = m?.content_sha256;
+          // This is a metadata-only operation. It must never relabel an old
+          // vector as the current source revision: that would turn a
+          // quarantined historical embedding into an apparently clean one.
+          if (isChromaContentHash(existingHash) && (
+            existingHash !== provenance.content_sha256
+            || this.sessionStore!.getChromaIndexStatus(docType, sqliteId, existingHash) !== 'clean'
+          )) {
+            // Adoption changes merged_into_project in the persisted row, so
+            // its complete-row hash is expected to change. Do not delete a
+            // current vector and leave the source absent from semantic
+            // retrieval: replace it through the same source-row gate that
+            // produced the original vector.
+            return { id, reindex: true as const, sqliteId };
+          }
           const merged: Record<string, any> = {
             ...(m ?? {}),
+            ...provenance,
+            doc_type: docType,
+            sqlite_id: sqliteId,
+            sensitivity: 'private',
+            acl: 'owner_local',
             merged_into_project: mergedIntoProject
           };
-          return Object.fromEntries(
-            Object.entries(merged).filter(
-              ([, v]) => v !== null && v !== undefined && v !== ''
-            )
-          );
-        });
-
-        await chromaMcp.callTool('chroma_update_documents', {
-          collection_name: this.collectionName,
-          ids: docIds,
-          metadatas
-        });
-        totalPatched += docIds.length;
+          return { id, metadata: Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== null && v !== undefined && v !== '')) };
+        }).filter((update): update is { id: string; metadata: Record<string, any>; reindex?: never } | { id: string; reindex: true; sqliteId: number } => update !== undefined);
+        const reindexIds = [...new Set(updates
+          .filter((update): update is { id: string; reindex: true; sqliteId: number } => 'reindex' in update)
+          .map(update => update.sqliteId))];
+        const metadataUpdates = updates.filter((update): update is { id: string; metadata: Record<string, any>; delete?: never } => 'metadata' in update);
+        if (metadataUpdates.length) {
+          await chromaMcp.callTool('chroma_update_documents', {
+            collection_name: this.collectionName,
+            ids: metadataUpdates.map(update => update.id),
+            metadatas: metadataUpdates.map(update => update.metadata)
+          });
+          totalPatched += metadataUpdates.length;
+        }
+        for (const sqliteId of reindexIds) {
+          const outcome = await this.indexSourceRow(this.sessionStore, docType, sqliteId);
+          if (outcome.documents === 0 && !outcome.quarantined) {
+            await this.deleteSourceDocuments(docType, sqliteId);
+          }
+          totalPatched += outcome.written;
+        }
       }
     }
 

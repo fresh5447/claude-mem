@@ -30,7 +30,12 @@ export class DatabaseManager {
 
     const chromaEnabled = settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false';
     if (chromaEnabled) {
-      this.chromaSync = new ChromaSync('claude-mem');
+      this.chromaSync = new ChromaSync('claude-mem', this.sessionStore);
+      // Tombstones survive a process interruption or a temporarily unavailable
+      // collection; replay them before normal backfill can consider sources.
+      this.chromaSync.reconcileDeletedSources().catch(error => {
+        logger.warn('CHROMA_SYNC', 'Deferred Chroma deletion reconciliation failed', {}, error as Error);
+      });
     } else {
       logger.info('DB', 'Chroma disabled via CLAUDE_MEM_CHROMA_ENABLED=false, using SQLite-only search');
     }

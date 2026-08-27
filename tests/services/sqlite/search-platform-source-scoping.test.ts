@@ -19,7 +19,7 @@ describe('search platform_source scoping', () => {
   ): void {
     const sdkId = store.createSDKSession(contentSessionId, 'scoping-project', 'prompt', undefined, platformSource);
     store.ensureMemorySessionIdRegistered(sdkId, memorySessionId);
-    store.storeObservation(memorySessionId, 'scoping-project', {
+    const result = store.storeObservation(memorySessionId, 'scoping-project', {
       type: 'discovery',
       title,
       subtitle: null,
@@ -29,6 +29,7 @@ describe('search platform_source scoping', () => {
       files_read: [],
       files_modified: [],
     }, 1);
+    store.recordChromaIndexPolicy('observation', result.id, result.id.toString(16).padStart(64, '0'), []);
   }
 
   function seedPrompt(
@@ -37,11 +38,12 @@ describe('search platform_source scoping', () => {
     promptText: string,
   ): void {
     const sdkId = store.createSDKSession(contentSessionId, 'scoping-project', 'prompt', undefined, platformSource);
-    store.saveUserPrompt(contentSessionId, 1, promptText, sdkId);
+    const result = store.saveUserPrompt(contentSessionId, 1, promptText, sdkId);
+    store.recordChromaIndexPolicy('user_prompt', result, result.toString(16).padStart(64, '0'), []);
   }
 
   function seedSummary(memorySessionId: string, request: string, createdAtEpoch: number): number {
-    return store.importSessionSummary({
+    const result = store.importSessionSummary({
       memory_session_id: memorySessionId,
       project: 'scoping-project',
       request,
@@ -56,7 +58,9 @@ describe('search platform_source scoping', () => {
       discovery_tokens: 0,
       created_at: new Date(createdAtEpoch).toISOString(),
       created_at_epoch: createdAtEpoch,
-    }).id;
+    });
+    store.recordChromaIndexPolicy('session_summary', result.id, result.id.toString(16).padStart(64, '0'), []);
+    return result.id;
   }
 
   beforeEach(() => {

@@ -833,6 +833,40 @@ describe('SyncApply', () => {
     expect(apply.getCursor()).toBe('3');
   });
 
+  it('tombstones and deletes the exact local Chroma source for canonical inbound deletion', async () => {
+    const deleted: Array<{ docType: string; sqliteId: number }> = [];
+    const chroma: ChromaSyncLike = {
+      async syncObservation() {},
+      async syncSummary() {},
+      async syncUserPrompt() {},
+      async deleteSource(docType, sqliteId) { deleted.push({ docType, sqliteId }); },
+    };
+    const apply = makeApply({ chromaSync: chroma });
+    apply.applyOps([op(1, 'observation', '11', obsBody(), {
+      rev: 1,
+    })]);
+    const local = db.prepare(
+      `SELECT id FROM observations WHERE origin_device_id = ? AND origin_local_id = ?`
+    ).get(REMOTE, '11') as { id: number };
+
+    apply.applyOps([{
+      ...op(2, 'observation', '11', {}, { rev: 2 }),
+      entity_id: 'observation:device-a:11',
+      entity_rev: '2',
+      operation_sha256: 'd'.repeat(64),
+      deleted: true,
+      deleted_at: REMOTE_ISO,
+    }]);
+    await sleep(10);
+
+    expect(db.prepare('SELECT id FROM observations WHERE id = ?').get(local.id)).toBeNull();
+    expect(db.prepare(`SELECT status, content_sha256 FROM chroma_index_ledger
+      WHERE doc_type = 'observation' AND sqlite_id = ?`).get(local.id)).toEqual({
+      status: 'deleted', content_sha256: '0'.repeat(64),
+    });
+    expect(deleted).toEqual([{ docType: 'observation', sqliteId: local.id }]);
+  });
+
   // ---------------------------------------------------------------------------
   // Epoch rebuild requeue: a MISMATCH means the hub's log was lost/rebuilt —
   // this device's corpus is not in the new log, so native rows must re-enter

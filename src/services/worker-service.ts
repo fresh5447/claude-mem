@@ -525,6 +525,7 @@ export class WorkerService implements WorkerRef {
         const syncApply = new SyncApply(this.dbManager.getConnection(), {
           deviceId: pullDeviceId,
           chromaSync: this.dbManager.getChromaSync(),
+          sessionStore: this.dbManager.getSessionStore(),
         });
         this.syncClient = new SyncClient(syncApply, {
           hubUrl: settings.CLAUDE_MEM_CLOUD_SYNC_HUB_URL,

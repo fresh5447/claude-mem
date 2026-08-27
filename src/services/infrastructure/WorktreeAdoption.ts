@@ -8,6 +8,7 @@ import { ChromaSync, MergedIntoProjectTarget } from '../sync/ChromaSync.js';
 import { emitRemapProject, hasSyncLane } from '../sync/remap-outbox.js';
 import { paths } from '../../shared/paths.js';
 import { openConfiguredSqliteDatabase } from '../sqlite/connection.js';
+import { SessionStore } from '../sqlite/SessionStore.js';
 
 const DEFAULT_DATA_DIR = paths.dataDir();
 
@@ -311,7 +312,11 @@ export async function adoptMergedWorktrees(opts: {
   }
 
   if (!dryRun && adoptedChromaTargets.length > 0) {
-    const chromaSync = new ChromaSync('claude-mem');
+    // Re-open the private source database so the metadata update crosses the
+    // same complete-row secret/ACL gate as every other Chroma mutation.
+    const chromaDb = openConfiguredSqliteDatabase(dbPath);
+    const chromaStore = new SessionStore(chromaDb);
+    const chromaSync = new ChromaSync('claude-mem', chromaStore);
     try {
       await chromaSync.updateMergedIntoProject(adoptedChromaTargets, parentProject);
       result.chromaUpdates = adoptedChromaTargets.length;
@@ -331,6 +336,8 @@ export async function adoptMergedWorktrees(opts: {
         );
       }
       result.chromaFailed = adoptedChromaTargets.length;
+    } finally {
+      chromaDb.close();
     }
   }
 

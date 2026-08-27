@@ -13,6 +13,21 @@ export class PaginationHelper {
     this.dbManager = dbManager;
   }
 
+  /** List endpoints are retrieval surfaces too: unknown or non-clean policy
+   * state is deliberately invisible, just like semantic and FTS results. */
+  private chromaEligibilityClause(tableAlias: string, docType: 'observation' | 'session_summary' | 'user_prompt'): string {
+    return `EXISTS (
+      SELECT 1 FROM chroma_index_ledger cil
+      WHERE cil.doc_type = '${docType}'
+        AND cil.sqlite_id = ${tableAlias}.id
+        AND cil.status = 'clean'
+        AND cil.updated_at_epoch = (
+          SELECT MAX(latest.updated_at_epoch) FROM chroma_index_ledger latest
+          WHERE latest.doc_type = '${docType}' AND latest.sqlite_id = ${tableAlias}.id
+        )
+    )`;
+  }
+
   private stripProjectPath(filePath: string, projectName: string): string {
     const leaf = projectName.includes('/') ? projectName.split('/').pop()! : projectName;
     const marker = `/${leaf}/`;
@@ -79,6 +94,8 @@ export class PaginationHelper {
     const params: SQLQueryBindings[] = [];
     const conditions: string[] = [];
 
+    conditions.push(this.chromaEligibilityClause('o', 'observation'));
+
     if (project) {
       conditions.push('(o.project = ? OR o.merged_into_project = ?)');
       params.push(project, project);
@@ -134,6 +151,8 @@ export class PaginationHelper {
 
     const conditions: string[] = [];
 
+    conditions.push(this.chromaEligibilityClause('ss', 'session_summary'));
+
     if (project) {
       conditions.push('(ss.project = ? OR ss.merged_into_project = ?)');
       params.push(project, project);
@@ -184,6 +203,8 @@ export class PaginationHelper {
     const params: any[] = [];
 
     const conditions: string[] = [];
+
+    conditions.push(this.chromaEligibilityClause('up', 'user_prompt'));
 
     if (project) {
       conditions.push('s.project = ?');

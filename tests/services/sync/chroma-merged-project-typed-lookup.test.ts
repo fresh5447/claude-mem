@@ -3,6 +3,8 @@ import * as realChromaMcpManager from '../../../src/services/sync/ChromaMcpManag
 
 const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
 const realChromaMcpManagerSnapshot = { ...realChromaMcpManager };
+let observationMetadata: Record<string, unknown> = { sqlite_id: 9, doc_type: 'observation' };
+let adoptedObservation = false;
 
 mock.module('../../../src/services/sync/ChromaMcpManager.js', () => ({
   ChromaMcpManager: {
@@ -17,7 +19,7 @@ mock.module('../../../src/services/sync/ChromaMcpManager.js', () => ({
           if (docType === 'observation') {
             return {
               ids: ['obs_9_narrative'],
-              metadatas: [{ sqlite_id: 9, doc_type: 'observation' }]
+              metadatas: [observationMetadata]
             };
           }
           if (docType === 'session_summary') {
@@ -39,9 +41,28 @@ mock.module('../../../src/services/sync/ChromaMcpManager.js', () => ({
 }));
 
 import { ChromaSync } from '../../../src/services/sync/ChromaSync.js';
+import { chromaSourceHash } from '../../../src/services/sync/ChromaIndexPolicy.js';
+
+function newSync(): ChromaSync {
+  const store = {
+    db: {
+      prepare: (sql: string) => ({
+        get: (id: number) => sql.includes('SELECT *')
+          ? { id, project: 'original', narrative: 'safe', ...(adoptedObservation ? { merged_into_project: 'parent' } : {}) }
+          : { project: 'original', platform_source: 'claude' },
+      }),
+    },
+    recordChromaIndexPolicy: () => {},
+    getChromaSourceStatus: () => null,
+    getChromaIndexStatus: () => 'clean',
+  };
+  return new ChromaSync('claude-mem', store as any);
+}
 
 afterEach(() => {
   calls.length = 0;
+  observationMetadata = { sqlite_id: 9, doc_type: 'observation' };
+  adoptedObservation = false;
 });
 
 afterAll(() => {
@@ -50,7 +71,7 @@ afterAll(() => {
 
 describe('ChromaSync merged project hydration', () => {
   it('patches session-summary documents for summary-only adoption', async () => {
-    await new ChromaSync('claude-mem').updateMergedIntoProject(
+    await newSync().updateMergedIntoProject(
       [{ docType: 'session_summary', sqliteId: 7 }],
       'parent'
     );
@@ -68,12 +89,18 @@ describe('ChromaSync merged project hydration', () => {
     expect(updateCall?.args.metadatas).toEqual([{
       sqlite_id: 7,
       doc_type: 'session_summary',
+      source_table: 'session_summaries',
+      project: 'original',
+      platform_source: 'claude',
+      sensitivity: 'private',
+      acl: 'owner_local',
+      content_sha256: chromaSourceHash({ id: 7, project: 'original', narrative: 'safe' }),
       merged_into_project: 'parent'
     }]);
   });
 
   it('does not update a prompt document with a colliding sqlite ID', async () => {
-    await new ChromaSync('claude-mem').updateMergedIntoProject(
+    await newSync().updateMergedIntoProject(
       [{ docType: 'session_summary', sqliteId: 7 }],
       'parent'
     );
@@ -84,7 +111,7 @@ describe('ChromaSync merged project hydration', () => {
   });
 
   it('patches observation documents with an observation-typed lookup', async () => {
-    await new ChromaSync('claude-mem').updateMergedIntoProject(
+    await newSync().updateMergedIntoProject(
       [{ docType: 'observation', sqliteId: 9 }],
       'parent'
     );
@@ -102,7 +129,34 @@ describe('ChromaSync merged project hydration', () => {
     expect(updateCall?.args.metadatas).toEqual([{
       sqlite_id: 9,
       doc_type: 'observation',
+      source_table: 'observations',
+      project: 'original',
+      platform_source: 'claude',
+      sensitivity: 'private',
+      acl: 'owner_local',
+      content_sha256: chromaSourceHash({ id: 9, project: 'original', narrative: 'safe' }),
       merged_into_project: 'parent'
     }]);
+  });
+
+  it('reindexes an adopted current vector when its complete-row hash changes', async () => {
+    observationMetadata = {
+      sqlite_id: 9,
+      doc_type: 'observation',
+      content_sha256: chromaSourceHash({ id: 9, project: 'original', narrative: 'safe', merged_into_project: null }),
+      source_table: 'observations',
+      project: 'original',
+      platform_source: 'claude',
+      sensitivity: 'private',
+      acl: 'owner_local',
+    };
+    adoptedObservation = true;
+
+    await newSync().updateMergedIntoProject([{ docType: 'observation', sqliteId: 9 }], 'parent');
+
+    expect(calls.some(call => call.name === 'chroma_delete_documents')).toBe(false);
+    const freshWrite = calls.find(call => call.name === 'chroma_add_documents');
+    expect(freshWrite?.args.ids).toEqual(['obs_9_narrative']);
+    expect((freshWrite?.args.metadatas as Array<Record<string, unknown>>)[0].merged_into_project).toBe('parent');
   });
 });

@@ -57,7 +57,11 @@ describe('DataRoutes synchronized delete APIs', () => {
 
     const routes = new DataRoutes(
       {} as any,
-      { getSessionStore: () => store, getCloudSync: () => sync } as any,
+      {
+        getSessionStore: () => store,
+        getCloudSync: () => sync,
+        getChromaSync: () => ({ deleteSource: async () => {} }),
+      } as any,
       {} as any,
       {} as any,
       {} as any,
@@ -79,7 +83,7 @@ describe('DataRoutes synchronized delete APIs', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('atomically tombstones observation, summary, and prompt deletions through registered production routes', () => {
+  it('atomically tombstones observation, summary, and prompt deletions through registered production routes', async () => {
     const cases = [
       ['/api/observation/:id', 'observation', 'observations'],
       ['/api/summary/:id', 'summary', 'session_summaries'],
@@ -94,10 +98,12 @@ describe('DataRoutes synchronized delete APIs', () => {
         json(value: unknown) { responseBody = value; return this; },
       } as unknown as Response;
       handlers.get(path)!({ params: { id: '1' }, path } as unknown as Request, response);
+      await Promise.resolve();
 
       expect(status).toBe(200);
       expect(responseBody).toMatchObject({ success: true, id: '1', kind, entity_rev: '2' });
       expect(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
+      expect(store.getChromaSourceStatus(kind === 'summary' ? 'session_summary' : kind === 'prompt' ? 'user_prompt' : 'observation', 1)).toBe('deleted');
     }
 
     const outbox = db.prepare(`
