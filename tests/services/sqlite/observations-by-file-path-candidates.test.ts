@@ -42,7 +42,9 @@ describe('getObservationsByFilePath — multi-candidate path matching (#2691)', 
       0,
       1_700_000_000_000,
     );
-    return result.observationIds[0];
+    const id = result.observationIds[0];
+    store.recordChromaIndexPolicy('observation', id, id.toString(16).padStart(64, '0'), []);
+    return id;
   }
 
   it('matches an observation stored under an ABSOLUTE path when querying multiple candidate forms', () => {

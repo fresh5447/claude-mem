@@ -25,13 +25,15 @@ describe('merged project ID hydration', () => {
       files_read: [],
       files_modified: [],
     }], null, 1, 0, 1_700_000_000_000);
-    return result.observationIds[0];
+    const id = result.observationIds[0];
+    store.recordChromaIndexPolicy('observation', id, id.toString(16).padStart(64, '0'), []);
+    return id;
   }
 
   function seedSummary(memorySessionId: string, project: string, request: string): number {
     const sdkSessionId = store.createSDKSession(`content-${memorySessionId}`, project, 'prompt');
     store.ensureMemorySessionIdRegistered(sdkSessionId, memorySessionId);
-    return store.importSessionSummary({
+    const result = store.importSessionSummary({
       memory_session_id: memorySessionId,
       project,
       request,
@@ -46,7 +48,9 @@ describe('merged project ID hydration', () => {
       discovery_tokens: 0,
       created_at: new Date(1_700_000_000_000).toISOString(),
       created_at_epoch: 1_700_000_000_000,
-    }).id;
+    });
+    store.recordChromaIndexPolicy('session_summary', result.id, result.id.toString(16).padStart(64, '0'), []);
+    return result.id;
   }
 
   it('hydrates a redirected observation by ID under the merged parent project', () => {
@@ -103,6 +107,8 @@ describe('merged project ID hydration', () => {
     const foreignSessionId = store.createSDKSession('foreign-prompt-session', 'other', 'prompt');
     const parentPromptId = store.saveUserPrompt('parent-prompt-session', 1, 'parent prompt', parentSessionId);
     const foreignPromptId = store.saveUserPrompt('foreign-prompt-session', 1, 'foreign prompt', foreignSessionId);
+    store.recordChromaIndexPolicy('user_prompt', parentPromptId, parentPromptId.toString(16).padStart(64, '0'), []);
+    store.recordChromaIndexPolicy('user_prompt', foreignPromptId, foreignPromptId.toString(16).padStart(64, '0'), []);
 
     const results = store.getUserPromptsByIds([parentPromptId, foreignPromptId], { orderBy: 'relevance', project: 'parent' });
 

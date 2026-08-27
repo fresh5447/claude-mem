@@ -32,11 +32,29 @@ export class SessionSearch {
     applySqliteConnectionPragmas(this.db);
 
     this._fts5Available = this.isFts5Available();
+    this._chromaLedgerAvailable = this.db.prepare(`SELECT 1 FROM sqlite_master
+      WHERE type = 'table' AND name = 'chroma_index_ledger'`).get() !== undefined;
 
     this.ensureFTSTables();
   }
 
   private _fts5Available: boolean;
+  private _chromaLedgerAvailable: boolean;
+
+  /** SQLite fallback search is subject to the same fail-closed policy as Chroma. */
+  private chromaEligibilityClause(tableAlias: string, docType: 'observation' | 'session_summary' | 'user_prompt'): string {
+    if (!this._chromaLedgerAvailable) return '0 = 1';
+    return `EXISTS (
+      SELECT 1 FROM chroma_index_ledger cil
+      WHERE cil.doc_type = '${docType}'
+        AND cil.sqlite_id = ${tableAlias}.id
+        AND cil.status = 'clean'
+        AND cil.updated_at_epoch = (
+          SELECT MAX(latest.updated_at_epoch) FROM chroma_index_ledger latest
+          WHERE latest.doc_type = '${docType}' AND latest.sqlite_id = ${tableAlias}.id
+        )
+    )`;
+  }
 
   private ensureFTSTables(): void {
     const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts'").all() as TableNameRow[];
@@ -259,7 +277,7 @@ export class SessionSearch {
       const sql = `
         SELECT o.*, o.discovery_tokens
         FROM observations o
-        WHERE ${filterClause}
+        WHERE ${filterClause} AND ${this.chromaEligibilityClause('o', 'observation')}
         ${orderClause}
         LIMIT ? OFFSET ?
       `;
@@ -278,6 +296,7 @@ export class SessionSearch {
         JOIN observations_fts ON observations_fts.rowid = o.id
         WHERE observations_fts MATCH ?
         ${filterClause ? 'AND ' + filterClause : ''}
+        AND ${this.chromaEligibilityClause('o', 'observation')}
         ${orderClause}
         LIMIT ? OFFSET ?
       `;
@@ -317,7 +336,7 @@ export class SessionSearch {
       const sql = `
         SELECT s.*, s.discovery_tokens
         FROM session_summaries s
-        WHERE ${filterClause}
+        WHERE ${filterClause} AND ${this.chromaEligibilityClause('s', 'session_summary')}
         ${orderClause}
         LIMIT ? OFFSET ?
       `;
@@ -343,6 +362,7 @@ export class SessionSearch {
         JOIN session_summaries_fts ON session_summaries_fts.rowid = s.id
         WHERE session_summaries_fts MATCH ?
         ${filterClause ? 'AND ' + filterClause : ''}
+        AND ${this.chromaEligibilityClause('s', 'session_summary')}
         ${orderClause}
         LIMIT ? OFFSET ?
       `;
@@ -374,7 +394,7 @@ export class SessionSearch {
     const sql = `
       SELECT o.*, o.discovery_tokens
       FROM observations o
-      WHERE ${filterClause}
+      WHERE ${filterClause} AND ${this.chromaEligibilityClause('o', 'observation')}
       ${orderClause}
       LIMIT ? OFFSET ?
     `;
@@ -434,7 +454,7 @@ export class SessionSearch {
     const observationsSql = `
       SELECT o.*, o.discovery_tokens
       FROM observations o
-      WHERE ${filterClause}
+      WHERE ${filterClause} AND ${this.chromaEligibilityClause('o', 'observation')}
       ${orderClause}
       LIMIT ? OFFSET ?
     `;
@@ -487,7 +507,7 @@ export class SessionSearch {
     const sessionsSql = `
       SELECT s.*, s.discovery_tokens
       FROM session_summaries s
-      WHERE ${baseConditions.join(' AND ')}
+      WHERE ${baseConditions.join(' AND ')} AND ${this.chromaEligibilityClause('s', 'session_summary')}
       ORDER BY s.created_at_epoch DESC
       LIMIT ? OFFSET ?
     `;
@@ -517,7 +537,7 @@ export class SessionSearch {
     const sql = `
       SELECT o.*, o.discovery_tokens
       FROM observations o
-      WHERE ${filterClause}
+      WHERE ${filterClause} AND ${this.chromaEligibilityClause('o', 'observation')}
       ${orderClause}
       LIMIT ? OFFSET ?
     `;
@@ -561,7 +581,7 @@ export class SessionSearch {
         throw new AppError(SessionSearch.MISSING_SEARCH_INPUT_MESSAGE, 400, 'INVALID_SEARCH_REQUEST');
       }
 
-      const whereClause = `WHERE ${baseConditions.join(' AND ')}`;
+      const whereClause = `WHERE ${[...baseConditions, this.chromaEligibilityClause('up', 'user_prompt')].join(' AND ')}`;
       const orderClause = orderBy === 'date_asc'
         ? 'ORDER BY up.created_at_epoch ASC'
         : 'ORDER BY up.created_at_epoch DESC';
@@ -587,7 +607,7 @@ export class SessionSearch {
     baseConditions.push("up.prompt_text LIKE ? ESCAPE '\\'");
     params.push(`%${escapedQuery}%`);
 
-    const whereClause = `WHERE ${baseConditions.join(' AND ')}`;
+    const whereClause = `WHERE ${[...baseConditions, this.chromaEligibilityClause('up', 'user_prompt')].join(' AND ')}`;
     const orderClause = orderBy === 'date_asc'
       ? 'ORDER BY up.created_at_epoch ASC'
       : 'ORDER BY up.created_at_epoch DESC';

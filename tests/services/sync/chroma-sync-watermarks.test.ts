@@ -111,6 +111,10 @@ function makeStoreFromRows(project: string, observationRows: ReturnType<typeof m
             return [];
           },
           get: (...params: Array<string | number>) => {
+            if (query.includes('SELECT * FROM observations')) {
+              return observationRows.find(row => row.id === params[0]) ?? undefined;
+            }
+
             if (query.includes('COUNT(*) as count FROM observations')) {
               return { count: observationRows.length };
             }
@@ -128,6 +132,8 @@ function makeStoreFromRows(project: string, observationRows: ReturnType<typeof m
         };
       },
     },
+    recordChromaIndexPolicy: () => {},
+    getChromaSourceStatus: () => null,
   } as any;
 }
 
@@ -143,7 +149,7 @@ describe('ChromaSync watermark gap persistence', () => {
 
   it('records bootstrap holes below the max embedded observation id', async () => {
     existingObservationIds = new Set([1, 3, 4]);
-    const sync = new ChromaSync(project);
+    const sync = new ChromaSync(project, makeStore(project, [5]));
 
     await sync.bootstrapWatermarksFromChroma(project, makeStore(project, [1, 2, 3, 4]));
 
@@ -158,7 +164,7 @@ describe('ChromaSync watermark gap persistence', () => {
       prompts: 0,
       pending: { observations: [2] },
     });
-    const sync = new ChromaSync(project);
+    const sync = new ChromaSync(project, makeStore(project, [5]));
 
     await sync.syncObservation(
       5,
@@ -211,10 +217,10 @@ describe('ChromaSync watermark gap persistence', () => {
       pending: {},
     });
     const sync = new ChromaSync(project) as ChromaSync & {
-      addDocuments: (documents: Array<{ id: string }>) => Promise<number>;
+      writeDocuments: (documents: Array<{ id: string }>) => Promise<number>;
     };
     let callCount = 0;
-    sync.addDocuments = async (documents) => {
+    sync.writeDocuments = async (documents) => {
       addDocumentCalls.push(documents.map(document => document.id));
       callCount += 1;
       return callCount === 2 ? 0 : documents.length;
@@ -225,7 +231,7 @@ describe('ChromaSync watermark gap persistence', () => {
     expect(ChromaSyncState.get(project).observations).toBe(0);
     expect(ChromaSyncState.getPending(project, 'observations')).toEqual([1]);
 
-    sync.addDocuments = async (documents) => {
+    sync.writeDocuments = async (documents) => {
       addDocumentCalls.push(documents.map(document => document.id));
       return documents.length;
     };

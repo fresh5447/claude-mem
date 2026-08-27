@@ -159,6 +159,8 @@
 import type { Database } from 'bun:sqlite';
 import { logger } from '../../utils/logger.js';
 import { DEFAULT_PLATFORM_SOURCE, normalizePlatformSource } from '../../shared/platform-source.js';
+import { SessionStore } from '../sqlite/SessionStore.js';
+import type { ChromaDocType } from './ChromaIndexPolicy.js';
 import {
   assertCanonicalDecimal,
   compareCanonicalDecimals,
@@ -230,6 +232,12 @@ export interface ChromaSyncLike {
     createdAtEpoch: number,
     platformSource?: string
   ): Promise<void>;
+  /**
+   * Exact source deletion is optional for compatibility with older injected
+   * forwarders. The durable ledger tombstone is always recorded; a real
+   * ChromaSync supplies this method and performs deletion after commit.
+   */
+  deleteSource?(docType: ChromaDocType, sqliteId: number): Promise<void>;
 }
 
 export interface SyncApplyOptions {
@@ -240,6 +248,8 @@ export interface SyncApplyOptions {
   deviceId: string;
   /** Optional Chroma forwarder; fired after commit, never awaited. */
   chromaSync?: ChromaSyncLike | null;
+  /** Private source store sharing this connection's transaction boundary. */
+  sessionStore?: SessionStore;
   /** Injectable clock for the synced_at stamp (tests). NEVER row identity. */
   now?: () => number;
 }
@@ -318,6 +328,7 @@ export class SyncApply {
   private readonly db: Database;
   private readonly deviceId: string;
   private readonly chromaSync: ChromaSyncLike | null;
+  private readonly sessionStore: SessionStore;
   private readonly now: () => number;
 
   constructor(db: Database, options: SyncApplyOptions) {
@@ -329,6 +340,10 @@ export class SyncApply {
     this.db = db;
     this.deviceId = options.deviceId;
     this.chromaSync = options.chromaSync ?? null;
+    // SyncApply is also used directly by the pull client. Reuse its owning
+    // private store when supplied; otherwise initialize the same connection
+    // so canonical inbound tombstones share the source-row transaction.
+    this.sessionStore = options.sessionStore ?? new SessionStore(db);
     this.now = options.now ?? Date.now;
   }
 
@@ -562,9 +577,23 @@ export class SyncApply {
         : op.kind === 'summary'
           ? 'session_summaries'
           : 'user_prompts';
-      this.db.prepare(
-        `DELETE FROM ${table} WHERE origin_device_id = ? AND origin_local_id = ?`
-      ).run(op.origin_device, op.origin_id);
+      const existing = this.findByOrigin(table, op.origin_device, op.origin_id);
+      if (existing) {
+        const docType: ChromaDocType = op.kind === 'observation'
+          ? 'observation'
+          : op.kind === 'summary'
+            ? 'session_summary'
+            : 'user_prompt';
+        // Record the tombstone before deleting the source row, in this same
+        // transaction, so an unavailable Chroma delete is retried at startup
+        // rather than leaving the exact vector eligible indefinitely.
+        this.sessionStore.markChromaSourceDeletedInTransaction(docType, existing.id);
+        this.db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(existing.id);
+        if (this.chromaSync?.deleteSource) {
+          const chroma = this.chromaSync;
+          chromaJobs.push(() => chroma.deleteSource!(docType, existing.id));
+        }
+      }
       outcome = 'applied';
     } else {
       outcome = this.applyRowOp(op, chromaJobs);
@@ -732,6 +761,29 @@ export class SyncApply {
         createdAt, createdAtEpoch, op.rev, this.now(),
         existing.id
       );
+      // Revisions are source mutations too. Re-submit the persisted row so
+      // ChromaSync can re-scan its complete current representation and replace
+      // (or quarantine) every deterministic vector for this source identity.
+      if (this.chromaSync) {
+        const chroma = this.chromaSync;
+        chromaJobs.push(() => chroma.syncObservation(
+          existing.id,
+          memorySessionId,
+          project,
+          {
+            type,
+            title: fieldString(op, body, 'title'),
+            subtitle: fieldString(op, body, 'subtitle'),
+            facts: parseListColumn(body.facts),
+            narrative: fieldString(op, body, 'narrative'),
+            concepts: parseListColumn(body.concepts),
+            files_read: parseListColumn(body.files_read),
+            files_modified: parseListColumn(body.files_modified),
+          },
+          fieldNumber(op, body, 'prompt_number') ?? 0,
+          createdAtEpoch,
+        ));
+      }
       return 'applied';
     }
 
@@ -817,6 +869,24 @@ export class SyncApply {
         op.rev, this.now(),
         existing.id
       );
+      if (this.chromaSync) {
+        const chroma = this.chromaSync;
+        chromaJobs.push(() => chroma.syncSummary(
+          existing.id,
+          memorySessionId,
+          project,
+          {
+            request: fieldString(op, body, 'request'),
+            investigated: fieldString(op, body, 'investigated'),
+            learned: fieldString(op, body, 'learned'),
+            completed: fieldString(op, body, 'completed'),
+            next_steps: fieldString(op, body, 'next_steps'),
+            notes: fieldString(op, body, 'notes'),
+          },
+          fieldNumber(op, body, 'prompt_number') ?? 0,
+          createdAtEpoch,
+        ));
+      }
       return 'applied';
     }
 
@@ -908,6 +978,18 @@ export class SyncApply {
         createdAt, createdAtEpoch, op.rev, this.now(),
         existing.id
       );
+      if (this.chromaSync) {
+        const chroma = this.chromaSync;
+        chromaJobs.push(() => chroma.syncUserPrompt(
+          existing.id,
+          fieldString(op, body, 'memory_session_id') ?? contentSessionId,
+          fieldString(op, body, 'project') ?? 'unknown',
+          promptText,
+          promptNumber,
+          createdAtEpoch,
+          fieldString(op, body, 'platform_source') ?? undefined,
+        ));
+      }
       return 'applied';
     }
 

@@ -38,6 +38,7 @@ describe('SessionStore.*ByIds — orderBy: "relevance" preserves caller ID order
         baseTs + i * 1000,
       );
       inserted.push(result.observationIds[0]);
+      store.recordChromaIndexPolicy('observation', result.observationIds[0], result.observationIds[0].toString(16).padStart(64, '0'), []);
     }
 
     const callerOrder = [...inserted].reverse();
@@ -71,6 +72,7 @@ describe('SessionStore.*ByIds — orderBy: "relevance" preserves caller ID order
         baseTs + i * 1000,
       );
       inserted.push(result.observationIds[0]);
+      store.recordChromaIndexPolicy('observation', result.observationIds[0], result.observationIds[0].toString(16).padStart(64, '0'), []);
     }
 
     const callerOrder = [...inserted].reverse();
@@ -89,7 +91,9 @@ describe('SessionStore.*ByIds — orderBy: "relevance" preserves caller ID order
 
     const inserted: number[] = [];
     for (let i = 0; i < 5; i++) {
-      inserted.push(store.saveUserPrompt('content-prompts', i, `prompt text ${i}`, sdkId));
+      const id = store.saveUserPrompt('content-prompts', i, `prompt text ${i}`, sdkId);
+      inserted.push(id);
+      store.recordChromaIndexPolicy('user_prompt', id, id.toString(16).padStart(64, '0'), []);
     }
 
     // Ask for them highest-id-first, so "oldest n" and "first n of caller order" differ.
@@ -107,7 +111,9 @@ describe('SessionStore.*ByIds — orderBy: "relevance" preserves caller ID order
 
     const inserted: number[] = [];
     for (let i = 0; i < 4; i++) {
-      inserted.push(store.saveUserPrompt('content-prompts-order', i, `prompt text ${i}`, sdkId));
+      const id = store.saveUserPrompt('content-prompts-order', i, `prompt text ${i}`, sdkId);
+      inserted.push(id);
+      store.recordChromaIndexPolicy('user_prompt', id, id.toString(16).padStart(64, '0'), []);
     }
 
     const callerOrder = [...inserted].reverse();

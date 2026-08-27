@@ -648,7 +648,12 @@ export class CloudSync {
    * Queue and apply a local content deletion atomically. The tombstone stays
    * durable in sync_content_outbox until Hub projection acknowledges it.
    */
-  queueDelete(kind: RowKind, originLocalId: string, deletedAt = new Date().toISOString()): string {
+  queueDelete(
+    kind: RowKind,
+    originLocalId: string,
+    deletedAt = new Date().toISOString(),
+    beforeLocalDelete?: () => void,
+  ): string {
     if (!this.isActive()) throw new Error('cloud sync must be configured before queueDelete');
     assertCanonicalDecimal(originLocalId);
     const entityId = stableDocumentId(kind, this.deviceId, originLocalId);
@@ -692,6 +697,7 @@ export class CloudSync {
         VALUES (?, ?, ?, ?, ?, ?, 1, ?)
         ON CONFLICT(entity_id, entity_rev) DO NOTHING
       `).run(entityId, kind, originLocalId, entityRev, op.body, op.operation_sha256, Date.now());
+      beforeLocalDelete?.();
       this.db.prepare(
         `DELETE FROM ${table} WHERE id = ? AND origin_device_id IS NULL`
       ).run(originLocalId);

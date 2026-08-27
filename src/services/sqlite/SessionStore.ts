@@ -24,6 +24,7 @@ import {
   validateCanonicalMutation,
   type CanonicalMutation,
 } from '../sync/CanonicalContent.js';
+import type { ChromaDocType, ChromaFindingKind, ChromaPolicyStatus } from '../sync/ChromaIndexPolicy.js';
 
 interface IndexColumnInfo {
   seqno: number;
@@ -120,6 +121,157 @@ export class SessionStore {
     this.ensureSyncRevisionTextAffinity();
     this.initializeSyncHubLaunchBaseline();
     this.normalizeConceptTags();
+    this.ensureChromaIndexLedger();
+  }
+
+  /** v50: private, plaintext-free Chroma eligibility and deletion ledger. */
+  private ensureChromaIndexLedger(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(50) as SchemaVersion | undefined;
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS chroma_index_ledger (
+        doc_type TEXT NOT NULL CHECK (doc_type IN ('observation', 'session_summary', 'user_prompt')),
+        sqlite_id INTEGER NOT NULL,
+        content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+        finding_kinds TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL CHECK (status IN ('clean', 'quarantined', 'deleted')),
+        created_at_epoch INTEGER NOT NULL,
+        updated_at_epoch INTEGER NOT NULL,
+        quarantined_at_epoch INTEGER,
+        deleted_at_epoch INTEGER,
+        PRIMARY KEY (doc_type, sqlite_id, content_sha256)
+      )
+    `);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_chroma_index_ledger_eligibility
+      ON chroma_index_ledger(doc_type, sqlite_id, status, updated_at_epoch DESC)`);
+    if (!applied) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(50, new Date().toISOString());
+    }
+  }
+
+  recordChromaIndexPolicy(
+    docType: ChromaDocType,
+    sqliteId: number,
+    contentSha256: string,
+    findings: ChromaFindingKind[],
+    status: ChromaPolicyStatus = findings.length ? 'quarantined' : 'clean'
+  ): void {
+    const latest = this.db.prepare(`
+      SELECT content_sha256, updated_at_epoch
+      FROM chroma_index_ledger
+      WHERE doc_type = ? AND sqlite_id = ?
+      ORDER BY updated_at_epoch DESC
+      LIMIT 1
+    `).get(docType, sqliteId) as { content_sha256: string; updated_at_epoch: number } | undefined;
+    // The ledger is ordered per source. Keep that ordering deterministic even
+    // when a clean rewrite follows a quarantine within one clock millisecond.
+    const now = Math.max(Date.now(), (latest?.updated_at_epoch ?? 0) + 1);
+    const normalizedFindings = JSON.stringify([...new Set(findings)].sort());
+    const existing = this.db.prepare(`
+      SELECT finding_kinds, status, updated_at_epoch, quarantined_at_epoch, deleted_at_epoch
+      FROM chroma_index_ledger
+      WHERE doc_type = ? AND sqlite_id = ? AND content_sha256 = ?
+    `).get(docType, sqliteId, contentSha256) as {
+      finding_kinds: string;
+      status: ChromaPolicyStatus;
+      updated_at_epoch: number;
+      quarantined_at_epoch: number | null;
+      deleted_at_epoch: number | null;
+    } | undefined;
+    // Revisiting an older digest after a newer revision must make it current
+    // again. A repeat scan of the already-current decision remains idempotent.
+    const advance = !existing
+      || existing.finding_kinds !== normalizedFindings
+      || existing.status !== status
+      || latest?.content_sha256 !== contentSha256;
+    this.db.prepare(`
+      INSERT INTO chroma_index_ledger
+        (doc_type, sqlite_id, content_sha256, finding_kinds, status, created_at_epoch, updated_at_epoch, quarantined_at_epoch, deleted_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(doc_type, sqlite_id, content_sha256) DO UPDATE SET
+        finding_kinds = excluded.finding_kinds,
+        status = excluded.status,
+        updated_at_epoch = CASE WHEN ? THEN excluded.updated_at_epoch ELSE chroma_index_ledger.updated_at_epoch END,
+        quarantined_at_epoch = CASE WHEN chroma_index_ledger.status != 'quarantined'
+            AND excluded.status = 'quarantined'
+          THEN excluded.quarantined_at_epoch ELSE chroma_index_ledger.quarantined_at_epoch END,
+        deleted_at_epoch = CASE WHEN chroma_index_ledger.status != 'deleted'
+            AND excluded.status = 'deleted'
+          THEN excluded.deleted_at_epoch ELSE chroma_index_ledger.deleted_at_epoch END
+    `).run(docType, sqliteId, contentSha256, normalizedFindings, status, now, now,
+      status === 'quarantined' ? now : null, status === 'deleted' ? now : null, advance ? 1 : 0);
+  }
+
+  markChromaSourceDeleted(docType: ChromaDocType, sqliteId: number): void {
+    this.db.transaction(() => this.markChromaSourceDeletedInTransaction(docType, sqliteId))();
+  }
+
+  /**
+   * Record a deletion tombstone within an already-open source-row transaction.
+   * Callers that also delete the source must use this form to leave no gap
+   * where the row is gone but Chroma has no durable retry record.
+   */
+  markChromaSourceDeletedInTransaction(docType: ChromaDocType, sqliteId: number): void {
+    // A fixed digest is safe here: it denotes a source deletion, never source text.
+    // Deletion is terminal for this source identity. Keep only its tombstone so
+    // retention never leaves historical content digests alongside a delete.
+    this.db.prepare('DELETE FROM chroma_index_ledger WHERE doc_type = ? AND sqlite_id = ?')
+      .run(docType, sqliteId);
+    this.recordChromaIndexPolicy(docType, sqliteId, '0'.repeat(64), [], 'deleted');
+  }
+
+  getChromaDeletedSources(): Array<{ docType: ChromaDocType; sqliteId: number }> {
+    return (this.db.prepare(`
+      SELECT doc_type, sqlite_id
+      FROM chroma_index_ledger
+      WHERE status = 'deleted'
+    `).all() as Array<{ doc_type: string; sqlite_id: number }>).map(row => ({
+      docType: row.doc_type as ChromaDocType,
+      sqliteId: row.sqlite_id as number,
+    }));
+  }
+
+  isChromaSourceEligible(docType: ChromaDocType, sqliteId: number): boolean {
+    const row = this.db.prepare(`
+      SELECT status FROM chroma_index_ledger
+      WHERE doc_type = ? AND sqlite_id = ?
+      ORDER BY updated_at_epoch DESC
+      LIMIT 1
+    `).get(docType, sqliteId) as { status: ChromaPolicyStatus } | undefined;
+    return row?.status === 'clean';
+  }
+
+  /** Vector retrieval admits only the source's current exact clean revision. */
+  isChromaEmbeddingEligible(docType: ChromaDocType, sqliteId: number, contentSha256: string): boolean {
+    const row = this.db.prepare(`
+      SELECT content_sha256, status FROM chroma_index_ledger
+      WHERE doc_type = ? AND sqlite_id = ? AND content_sha256 = ?
+    `).get(docType, sqliteId, contentSha256) as { status: ChromaPolicyStatus } | undefined;
+    if (row?.status !== 'clean') return false;
+    const latest = this.db.prepare(`
+      SELECT content_sha256, status FROM chroma_index_ledger
+      WHERE doc_type = ? AND sqlite_id = ?
+      ORDER BY updated_at_epoch DESC
+      LIMIT 1
+    `).get(docType, sqliteId) as { content_sha256: string; status: ChromaPolicyStatus } | undefined;
+    return latest?.status === 'clean' && latest.content_sha256 === contentSha256;
+  }
+
+  getChromaIndexStatus(docType: ChromaDocType, sqliteId: number, contentSha256: string): ChromaPolicyStatus | null {
+    const row = this.db.prepare(`
+      SELECT status FROM chroma_index_ledger
+      WHERE doc_type = ? AND sqlite_id = ? AND content_sha256 = ?
+    `).get(docType, sqliteId, contentSha256) as { status: ChromaPolicyStatus } | undefined;
+    return row?.status ?? null;
+  }
+
+  getChromaSourceStatus(docType: ChromaDocType, sqliteId: number): ChromaPolicyStatus | null {
+    const row = this.db.prepare(`
+      SELECT status FROM chroma_index_ledger
+      WHERE doc_type = ? AND sqlite_id = ?
+      ORDER BY updated_at_epoch DESC
+      LIMIT 1
+    `).get(docType, sqliteId) as { status: ChromaPolicyStatus } | undefined;
+    return row?.status ?? null;
   }
 
   private getIndexColumns(indexName: string): string[] {
@@ -2182,6 +2334,15 @@ export class SessionStore {
       SELECT title, subtitle, type, prompt_number
       FROM observations
       WHERE memory_session_id = ?
+        AND EXISTS (
+          SELECT 1 FROM chroma_index_ledger cil
+          WHERE cil.doc_type = 'observation' AND cil.sqlite_id = observations.id
+            AND cil.status = 'clean'
+            AND cil.updated_at_epoch = (
+              SELECT MAX(latest.updated_at_epoch) FROM chroma_index_ledger latest
+              WHERE latest.doc_type = 'observation' AND latest.sqlite_id = observations.id
+            )
+        )
       ${platformClause}
       ORDER BY created_at_epoch ASC
     `);
@@ -2190,6 +2351,7 @@ export class SessionStore {
   }
 
   getObservationById(id: number, platformSource?: string): ObservationRecord | null {
+    if (!this.isChromaSourceEligible('observation', id)) return null;
     if (!platformSource) {
       const stmt = this.db.prepare(`
         SELECT *
@@ -2280,7 +2442,8 @@ export class SessionStore {
       ${limitClause}
     `);
 
-    const rows = stmt.all(...params) as ObservationSearchResult[];
+    const rows = (stmt.all(...params) as ObservationSearchResult[])
+      .filter(row => this.isChromaSourceEligible('observation', row.id));
     if (!preserveIdOrder) return rows;
 
     const rowMap = new Map(rows.map(r => [r.id, r]));
@@ -2310,6 +2473,15 @@ export class SessionStore {
         created_at_epoch
       FROM session_summaries
       WHERE memory_session_id = ?
+        AND EXISTS (
+          SELECT 1 FROM chroma_index_ledger cil
+          WHERE cil.doc_type = 'session_summary' AND cil.sqlite_id = session_summaries.id
+            AND cil.status = 'clean'
+            AND cil.updated_at_epoch = (
+              SELECT MAX(latest.updated_at_epoch) FROM chroma_index_ledger latest
+              WHERE latest.doc_type = 'session_summary' AND latest.sqlite_id = session_summaries.id
+            )
+        )
       ${platformClause}
       ORDER BY created_at_epoch DESC
       LIMIT 1
@@ -2741,7 +2913,8 @@ export class SessionStore {
       ${limitClause}
     `);
 
-    const rows = stmt.all(...params) as SessionSummarySearchResult[];
+    const rows = (stmt.all(...params) as SessionSummarySearchResult[])
+      .filter(row => this.isChromaSourceEligible('session_summary', row.id));
     if (!preserveIdOrder) return rows;
 
     const rowMap = new Map(rows.map(r => [r.id, r]));
@@ -2790,7 +2963,8 @@ export class SessionStore {
       ${limitClause}
     `);
 
-    const rows = stmt.all(...params) as UserPromptRecord[];
+    const rows = (stmt.all(...params) as UserPromptRecord[])
+      .filter(row => this.isChromaSourceEligible('user_prompt', row.id));
     if (!preserveIdOrder) return rows;
 
     const rowMap = new Map(rows.map(r => [r.id, r]));
@@ -2959,8 +3133,8 @@ export class SessionStore {
     const prompts = this.db.prepare(promptQuery).all(startEpoch, endEpoch, ...promptScope.params) as UserPromptRecord[];
 
     return {
-      observations,
-      sessions: sessions.map(s => ({
+      observations: observations.filter(row => this.isChromaSourceEligible('observation', row.id)),
+      sessions: sessions.filter(row => this.isChromaSourceEligible('session_summary', row.id)).map(s => ({
         id: s.id,
         memory_session_id: s.memory_session_id,
         project: s.project,
@@ -2970,7 +3144,7 @@ export class SessionStore {
         created_at: s.created_at,
         created_at_epoch: s.created_at_epoch
       })),
-      prompts: prompts.map(p => ({
+      prompts: prompts.filter(row => this.isChromaSourceEligible('user_prompt', row.id)).map(p => ({
         id: p.id,
         content_session_id: p.content_session_id,
         prompt_number: p.prompt_number,

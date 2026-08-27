@@ -18,6 +18,7 @@ import { getObservationsByFilePath } from '../../../sqlite/observations/get.js';
 import { getFirstObservationCreatedAt } from '../../../sqlite/observations/recent.js';
 import { getUptimeSeconds } from '../../../../shared/uptime.js';
 import { assertCanonicalDecimal, type ContentKind } from '../../../sync/CanonicalContent.js';
+import type { ChromaDocType } from '../../../sync/ChromaIndexPolicy.js';
 
 const integerArrayLike = z.preprocess((value) => {
   if (Array.isArray(value)) return value;
@@ -218,25 +219,25 @@ export class DataRoutes extends BaseRouteHandler {
     res.json(prompts[0]);
   });
 
-  private handleDeleteObservation = this.wrapHandler((req: Request, res: Response): void => {
-    this.deleteSyncedContent(req, res, 'observation', 'observations');
+  private handleDeleteObservation = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    await this.deleteSyncedContent(req, res, 'observation', 'observations');
   });
 
-  private handleDeleteSummary = this.wrapHandler((req: Request, res: Response): void => {
-    this.deleteSyncedContent(req, res, 'summary', 'session_summaries');
+  private handleDeleteSummary = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    await this.deleteSyncedContent(req, res, 'summary', 'session_summaries');
   });
 
-  private handleDeletePrompt = this.wrapHandler((req: Request, res: Response): void => {
-    this.deleteSyncedContent(req, res, 'prompt', 'user_prompts');
+  private handleDeletePrompt = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    await this.deleteSyncedContent(req, res, 'prompt', 'user_prompts');
   });
 
   /** Production deletion surface: tombstone enqueue and row delete are one transaction. */
-  private deleteSyncedContent(
+  private async deleteSyncedContent(
     req: Request,
     res: Response,
     kind: ContentKind,
     table: 'observations' | 'session_summaries' | 'user_prompts',
-  ): void {
+  ): Promise<void> {
     let originLocalId: string;
     try {
       originLocalId = assertCanonicalDecimal(req.params.id, { positive: true });
@@ -255,14 +256,28 @@ export class DataRoutes extends BaseRouteHandler {
       return;
     }
 
+    // Do not report a completed source deletion while its prior private
+    // embedding cannot be removed. This is intentionally checked before any
+    // local row or cloud-sync mutation.
+    const chromaSync = this.dbManager.getChromaSync();
+    if (!chromaSync) {
+      res.status(503).json({ error: 'Chroma deletion unavailable; source was not deleted' });
+      return;
+    }
+
     const cloudSync = this.dbManager.getCloudSync();
     let entityRev: string | null = null;
+    const chromaDocType: ChromaDocType = kind === 'summary' ? 'session_summary' : kind === 'prompt' ? 'user_prompt' : 'observation';
     if (cloudSync?.isConfigured()) {
       if (!cloudSync.status().deviceId) {
         res.status(503).json({ error: 'cloud sync identity unavailable; refusing an unreplicated delete' });
         return;
       }
-      entityRev = cloudSync.queueDelete(kind, originLocalId);
+      // CloudSync owns the source-row delete, so install the Chroma tombstone
+      // in its transaction immediately before that delete.
+      entityRev = cloudSync.queueDelete(kind, originLocalId, undefined, () => {
+        store.markChromaSourceDeletedInTransaction(chromaDocType, Number(originLocalId));
+      });
     } else {
       // A row with an acknowledged entity head must never be silently deleted
       // while its sync identity is unavailable: that would strand replicas.
@@ -274,10 +289,17 @@ export class DataRoutes extends BaseRouteHandler {
         res.status(503).json({ error: 'cloud sync unavailable; refusing an unreplicated delete' });
         return;
       }
-      store.db.prepare(
-        `DELETE FROM ${table} WHERE id = ? AND origin_device_id IS NULL`
-      ).run(originLocalId);
+      store.db.transaction(() => {
+        store.markChromaSourceDeletedInTransaction(chromaDocType, Number(originLocalId));
+        store.db.prepare(
+          `DELETE FROM ${table} WHERE id = ? AND origin_device_id IS NULL`
+        ).run(originLocalId);
+      })();
     }
+
+    // A Chroma failure propagates after the database transaction. Its durable
+    // tombstone is retained for startup reconciliation of this exact identity.
+    await chromaSync.deleteSource(chromaDocType, Number(originLocalId), store);
 
     res.json({ success: true, id: originLocalId, kind, entity_rev: entityRev });
   }

@@ -24,9 +24,27 @@ afterAll(() => {
 });
 
 describe('ChromaSync unavailable degradation', () => {
-  it('returns without throwing when collection creation hits known unavailable state', async () => {
+  it('returns without throwing when a source-gated write hits a known unavailable state', async () => {
     callCount = 0;
-    const sync = new ChromaSync('project');
+    const store = {
+      db: {
+        prepare: () => ({
+          get: () => ({
+            id: 1,
+            content_session_id: 'content-1',
+            prompt_number: 1,
+            prompt_text: 'hello',
+            created_at_epoch: 1,
+            memory_session_id: 'mem-1',
+            project: 'project',
+            platform_source: 'claude',
+          }),
+        }),
+      },
+      recordChromaIndexPolicy: () => {},
+      getChromaSourceStatus: () => null,
+    };
+    const sync = new ChromaSync('project', store as any);
 
     await expect(sync.syncUserPrompt(
       1,
